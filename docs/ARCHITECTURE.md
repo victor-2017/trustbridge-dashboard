@@ -139,7 +139,36 @@ The endpoint exposes two query fields:
 - `contributors(first, after)` returns a cursor-paginated `nodes` page,
   `hasMore`, and `nextCursor`. It requires the same maintainer session as
   `GET /api/contributors/paginated`. `first` defaults to 25 and is limited to
-  1–100.
+  1–100. An undecodable `after` cursor fails with GraphQL error
+  `extensions.code = "INVALID_CURSOR"` (same contract as the REST route) — it
+  never silently restarts at page 0.
+
+### Cursor pagination error contract (#658)
+
+`GET /api/contributors/paginated` validates `cursor` before touching the
+database. Malformed cursors return **400** with
+`{ error, code: "INVALID_CURSOR", message, remediation }` from
+`src/lib/cursor-pagination.ts` (`buildInvalidCursorError()`). Omitted or empty
+cursors still mean “first page”. Client hook `useInfiniteContributors` surfaces
+the remediation text instead of looping. See
+[LOGGING_AND_PAGINATION.md](./LOGGING_AND_PAGINATION.md#invalid-cursor-error-contract-issue-658).
+
+### Ban / unban race safety (#660)
+
+`banContributor` / `unbanContributor` run their dual-surface writes
+(`User` flags + `BannedContributor`) inside one `prisma.$transaction`. Audit
+rows (`contributor.banned` / `contributor.unbanned`) are written only after a
+successful commit. Self-ban and self-unban are rejected with HTTP 403 and
+`code` `SELF_BAN_FORBIDDEN` / `SELF_UNBAN_FORBIDDEN`. Details:
+[MAINTAINER_WORKFLOW.md](./MAINTAINER_WORKFLOW.md#race-safety-and-self-moderation-issue-660).
+
+### Feature-flag percentage rollouts (#661)
+
+Optional sticky percentage rollouts via `FEATURE_FLAG_<KEY>_ROLLOUT_PERCENT`
+use FNV-1a bucketing (`rolloutBucket` / `isFeatureEnabledForSubject` in
+`src/lib/feature-flags.ts`). `GET`/`POST /api/settings/feature-flags` both
+require a maintainer session; `POST` also enforces same-origin CSRF. See
+[FEATURE_FLAGS.md](./FEATURE_FLAGS.md#percentage-rollouts-sticky-bucketing-issue-661).
 
 The schema is intentionally allow-listed and read-only. It exposes no user
 tokens, wallet-proof data, or Horizon debug payloads, and it defines no
@@ -329,6 +358,92 @@ The `syncContractToPostgres()` function (`src/lib/contract-sync.ts`) performs a 
 | Trigger | Manual (maintainer) or batch | Scheduler (cron) |
 | Function | `refreshAllContributors()` | `syncContractToPostgres()` |
 | Route | `POST /api/contributors` | `POST /api/contract-sync` |
+
+### Lag monitoring, health & alerts (issue #659)
+
+Contract sync tracks two progress signals in-process (`src/lib/contract-sync.ts`):
+
+1. **Last successful sync** — recorded only when a run completes end-to-end
+   (RPC fetch *and* Postgres merge). A failing run never refreshes progress.
+2. **RPC cursor** — the `latestLedger` value reported by the Soroban RPC
+   `simulateTransaction` response (or an injected cursor in tests). The cursor
+   "advances" only when its value changes between successful runs; a frozen
+   value keeps its original timestamp so the stall clock keeps ticking.
+
+Lag is evaluated by the pure `evaluateContractSyncLag(snapshot, thresholds)`
+function, so every path is testable with injected clocks and cursors — no RPC
+network, no timers. State is process-local (like the rest of the module) and
+read by `/api/health`, `GET /api/contract-sync` and `/api/metrics/prometheus`.
+
+#### Configuration
+
+| Env var | Default | Meaning |
+|---|---|---|
+| `CONTRACT_SYNC_LAG_THRESHOLD_MS` | `900000` (15 min) | Age of progress that counts as **lagging**. Non-positive/invalid values fall back to the default. |
+| `CONTRACT_SYNC_STALL_THRESHOLD_MS` | `3600000` (60 min) | Age of progress (or of the last cursor advance) that counts as **stalled**. |
+| `CONTRACT_SYNC_ALERT_WEBHOOK_URL` | _(unset)_ | Optional maintainer notification webhook (Slack-style `text` payload; same delivery semantics as `CRON_EXPORT_ALERT_WEBHOOK_URL`). Unset = alerts disabled. |
+| `CONTRACT_SYNC_ALERT_PAGERDUTY_KEY` | _(unset)_ | Optional PagerDuty Events API v2 `routing_key` added to the alert payload. |
+| `CONTRACT_SYNC_ALERT_COOLDOWN_MS` | `1800000` (30 min) | Minimum interval between alert *delivery attempts* (bounds retries after a failed delivery and rapid episode flapping). |
+
+#### Statuses and reason codes
+
+`ContractSyncLagState` = `{ status, reason, sinceLastSuccessMs,
+sinceLastCursorAdvanceMs, thresholdMs, stallThresholdMs, cursor, lastSuccessAt }`.
+
+| `status` | `reason` | Meaning |
+|---|---|---|
+| `ok` | `ok` | Progress within the lag threshold. |
+| `ok` | `no_data` | Process has not recorded a sync yet (within the grace period). |
+| `ok` | `not_configured` | Last run failed with `contract_not_configured` — sync is intentionally idle, never alerted. |
+| `lagging` | `never_succeeded` | No successful sync since process start, older than the lag threshold. |
+| `lagging` | `sync_delayed` | No successful sync for ≥ lag threshold, < stall threshold. |
+| `stalled` | `never_succeeded` | No successful sync since process start, older than the stall threshold. |
+| `stalled` | `sync_stalled` | No successful sync for ≥ stall threshold. |
+| `stalled` | `cursor_stalled` | Runs succeed but the observed RPC cursor has not advanced for ≥ stall threshold (stale on-chain view). |
+
+Recovery is automatic: the next successful run (or an advanced cursor) returns
+the state to `ok` and closes the alert episode.
+
+#### Where it is exposed
+
+- **`GET /api/health`** → `checks.contractSync.lag` (adds `status`, `lagStatus`,
+  `reason`, `sinceLastSuccessMs`, `sinceLastCursorAdvanceMs`, `thresholdMs`,
+  `stallThresholdMs`, `cursor` to the existing `contractSync` check). A `lagging`
+  or `stalled` state degrades `checks.contractSync.status` and therefore the
+  overall health status (`healthStatusCode()` still returns `200`).
+- **`GET /api/contract-sync`** → top-level `lag` alongside the existing `lastRun`.
+- **`GET /api/metrics/prometheus`** → `trustbridge_contract_sync_lag_status`
+  (`0=ok 1=lagging 2=stalled`, labelled with `reason`),
+  `trustbridge_contract_sync_since_last_success_seconds`,
+  `trustbridge_contract_sync_since_last_cursor_advance_seconds` (`-1` = no
+  observation), `trustbridge_contract_sync_lag_threshold_seconds`,
+  `trustbridge_contract_sync_stall_threshold_seconds`,
+  `trustbridge_contract_sync_last_success_timestamp_seconds`, and the counter
+  `trustbridge_contract_sync_lag_alerts_total`.
+
+#### Maintainer notifications
+
+Alerts fire from non-skipped `runContractSync()` runs (scheduler-driven). When
+`CONTRACT_SYNC_ALERT_WEBHOOK_URL` is set, each transition into a
+`lagging`/`stalled` episode posts one payload
+(`source: "trustbridge-contract-sync"`, `status`, `reason`, thresholds,
+progress ages, `text`, optional PagerDuty `routing_key`). Delivery is
+fire-and-forget with a 5s timeout, is redacted through `redactAlertText()`,
+and never throws — a webhook outage cannot affect sync results.
+
+Anti-spam guarantees (tested):
+
+- one successful notification per `status:reason` episode — a sustained stall
+  does not re-notify;
+- recovery (`ok`) closes the episode, so a *future* stall notifies again;
+- failed deliveries are retried on later runs but never more often than
+  `CONTRACT_SYNC_ALERT_COOLDOWN_MS`;
+- no webhook configured ⇒ silent no-op.
+
+If the scheduler stops calling `POST /api/contract-sync` entirely, no in-process
+alert fires (there is no run to evaluate); lag still ages in `/api/health` and
+the Prometheus gauges, so external alerting on
+`trustbridge_contract_sync_lag_status` covers that failure mode.
 
 ---
 
